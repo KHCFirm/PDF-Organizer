@@ -60,13 +60,12 @@ STRICT_NEGATIVE_TERMS = [
     "printed on:",
     "generated on",
     "page ",
+    "mrn",
+    "account number",
 ]
 
-MONTH_WORDS = [
-    "jan", "january", "feb", "february", "mar", "march", "apr", "april", "may",
-    "jun", "june", "jul", "july", "aug", "august", "sep", "sept", "september",
-    "oct", "october", "nov", "november", "dec", "december",
-]
+TOP_LEFT_WIDTH_RATIO = 0.45
+TOP_LEFT_HEIGHT_RATIO = 0.35
 
 
 @dataclass
@@ -78,10 +77,10 @@ class DateCandidate:
     start: int
     end: int
     context: str
+    source_region: str  # "top_left", "full_page", "ocr_top_left", "ocr_full_page"
 
 
 def normalize_year(dt: datetime) -> datetime:
-    # Helps with ambiguous 2-digit years parsed too far in the future.
     if dt.year > datetime.now().year + 1:
         return dt.replace(year=dt.year - 100)
     return dt
@@ -104,23 +103,53 @@ def collapse_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def get_top_left_rect(page: fitz.Page) -> fitz.Rect:
+    rect = page.rect
+    return fitz.Rect(
+        rect.x0,
+        rect.y0,
+        rect.x0 + rect.width * TOP_LEFT_WIDTH_RATIO,
+        rect.y0 + rect.height * TOP_LEFT_HEIGHT_RATIO,
+    )
+
+
 def extract_page_text(page: fitz.Page) -> str:
     text = page.get_text("text")
+    return collapse_whitespace(text)
+
+
+def extract_top_left_text(page: fitz.Page) -> str:
+    rect = get_top_left_rect(page)
+    text = page.get_text("text", clip=rect)
     return collapse_whitespace(text)
 
 
 def render_page_for_ocr(page: fitz.Page, scale: float = 2.0) -> Image.Image:
     matrix = fitz.Matrix(scale, scale)
     pix = page.get_pixmap(matrix=matrix, alpha=False)
-    mode = "RGB"
-    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     return img
 
 
-def ocr_page(page: fitz.Page) -> str:
-    img = render_page_for_ocr(page, scale=2.0)
+def crop_top_left_for_ocr(page: fitz.Page, scale: float = 2.0) -> Image.Image:
+    rect = get_top_left_rect(page)
+    matrix = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=matrix, clip=rect, alpha=False)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    return img
+
+
+def ocr_image(img: Image.Image) -> str:
     text = pytesseract.image_to_string(img)
     return collapse_whitespace(text)
+
+
+def ocr_page(page: fitz.Page) -> str:
+    return ocr_image(render_page_for_ocr(page, scale=2.0))
+
+
+def ocr_top_left(page: fitz.Page) -> str:
+    return ocr_image(crop_top_left_for_ocr(page, scale=2.5))
 
 
 def find_regex_date_matches(text: str) -> List[Tuple[str, int, int]]:
@@ -141,42 +170,78 @@ def find_regex_date_matches(text: str) -> List[Tuple[str, int, int]]:
     return deduped
 
 
+def needs_ocr(text: str) -> bool:
+    if not text:
+        return True
+
+    stripped = collapse_whitespace(text)
+    if len(stripped) < 30:
+        return True
+
+    alnum_count = sum(ch.isalnum() for ch in stripped)
+    return alnum_count < 15
+
+
 def score_candidate(
     text: str,
     start: int,
     end: int,
+    source_region: str,
     strict_context: bool = True,
 ) -> Tuple[float, str]:
     window_start = max(0, start - 120)
     window_end = min(len(text), end + 120)
     context = text[window_start:window_end].lower()
+    before = text[max(0, start - 50):start].lower()
 
     score = 0.0
 
     for term in POSITIVE_TERMS:
         if term in context:
-            score += 5.0
+            score += 7.0
 
     for term in NEGATIVE_TERMS:
         if term in context:
-            score -= 4.0
+            score -= 6.0
 
     if strict_context:
         for term in STRICT_NEGATIVE_TERMS:
             if term in context:
-                score -= 3.0
+                score -= 4.0
 
-    before = text[max(0, start - 40):start].lower()
     if any(term in before for term in POSITIVE_TERMS):
-        score += 8.0
+        score += 18.0
 
     if any(term in before for term in NEGATIVE_TERMS):
-        score -= 8.0
+        score -= 18.0
+
+    # Strong preference for top-left region
+    if source_region in {"top_left", "ocr_top_left"}:
+        score += 20.0
+    else:
+        score -= 4.0
+
+    # Extra preference if the label is immediately before the date
+    label_patterns = [
+        r"(date of service|dos|service date)\s*[:\-]?\s*$",
+    ]
+    for pat in label_patterns:
+        if re.search(pat, before, flags=re.IGNORECASE):
+            score += 25.0
+
+    # Penalize likely footer/header garbage
+    footerish = ["printed on", "generated on", "page ", "electronically signed"]
+    if any(term in context for term in footerish):
+        score -= 10.0
 
     return score, collapse_whitespace(context)
 
 
-def extract_date_candidates(text: str, strict_context: bool = True) -> List[DateCandidate]:
+def extract_date_candidates(
+    text: str,
+    source_region: str,
+    strict_context: bool = True,
+) -> List[DateCandidate]:
     candidates: List[DateCandidate] = []
 
     for raw, start, end in find_regex_date_matches(text):
@@ -184,7 +249,6 @@ def extract_date_candidates(text: str, strict_context: bool = True) -> List[Date
         if not dt:
             continue
 
-        # Filter obviously unreasonable dates for medical record sorting.
         if dt.year < 1900 or dt.year > datetime.now().year + 1:
             continue
 
@@ -192,6 +256,7 @@ def extract_date_candidates(text: str, strict_context: bool = True) -> List[Date
             text=text,
             start=start,
             end=end,
+            source_region=source_region,
             strict_context=strict_context,
         )
 
@@ -204,26 +269,20 @@ def extract_date_candidates(text: str, strict_context: bool = True) -> List[Date
                 start=start,
                 end=end,
                 context=context,
+                source_region=source_region,
             )
         )
 
     deduped = {}
     for c in candidates:
-        key = (c.normalized, c.raw_text.lower())
+        key = (c.normalized, c.raw_text.lower(), c.source_region)
         if key not in deduped or c.score > deduped[key].score:
             deduped[key] = c
 
-    return sorted(
-        deduped.values(),
-        key=lambda x: (x.score, x.dt),
-        reverse=True,
-    )
+    return sorted(deduped.values(), key=lambda x: (x.score, x.dt), reverse=True)
 
 
-def choose_candidate(
-    candidates: List[DateCandidate],
-    mode: str = "contextual",
-) -> Optional[DateCandidate]:
+def choose_candidate(candidates: List[DateCandidate], mode: str = "contextual") -> Optional[DateCandidate]:
     if not candidates:
         return None
 
@@ -233,53 +292,98 @@ def choose_candidate(
     if mode == "latest":
         return sorted(candidates, key=lambda x: x.dt)[-1]
 
-    # contextual
     return sorted(candidates, key=lambda x: (x.score, x.dt), reverse=True)[0]
 
 
-def needs_ocr(text: str) -> bool:
-    if not text:
-        return True
+def gather_candidates_for_page(page: fitz.Page, use_ocr: bool, strict_context: bool) -> Tuple[List[DateCandidate], dict]:
+    region_debug = {
+        "top_left_text": "",
+        "full_page_text": "",
+        "ocr_top_left_text": "",
+        "ocr_full_page_text": "",
+        "used_ocr_top_left": False,
+        "used_ocr_full_page": False,
+    }
 
-    stripped = collapse_whitespace(text)
-    if len(stripped) < 40:
-        return True
+    all_candidates: List[DateCandidate] = []
 
-    alnum_count = sum(ch.isalnum() for ch in stripped)
-    return alnum_count < 20
+    # 1. Top-left searchable text first
+    top_left_text = extract_top_left_text(page)
+    region_debug["top_left_text"] = top_left_text
+    all_candidates.extend(
+        extract_date_candidates(top_left_text, source_region="top_left", strict_context=strict_context)
+    )
+
+    # 2. If top-left is weak, OCR top-left
+    if use_ocr and needs_ocr(top_left_text):
+        ocr_tl = ocr_top_left(page)
+        region_debug["ocr_top_left_text"] = ocr_tl
+        if ocr_tl:
+            region_debug["used_ocr_top_left"] = True
+            all_candidates.extend(
+                extract_date_candidates(ocr_tl, source_region="ocr_top_left", strict_context=strict_context)
+            )
+
+    # 3. Full page searchable text as fallback
+    full_page_text = extract_page_text(page)
+    region_debug["full_page_text"] = full_page_text
+    all_candidates.extend(
+        extract_date_candidates(full_page_text, source_region="full_page", strict_context=strict_context)
+    )
+
+    # 4. OCR full page only if needed
+    if use_ocr and needs_ocr(full_page_text):
+        ocr_fp = ocr_page(page)
+        region_debug["ocr_full_page_text"] = ocr_fp
+        if ocr_fp:
+            region_debug["used_ocr_full_page"] = True
+            all_candidates.extend(
+                extract_date_candidates(ocr_fp, source_region="ocr_full_page", strict_context=strict_context)
+            )
+
+    # Deduplicate across regions, keeping best score
+    best_by_date = {}
+    for c in all_candidates:
+        key = (c.normalized, c.raw_text.lower())
+        if key not in best_by_date or c.score > best_by_date[key].score:
+            best_by_date[key] = c
+
+    final_candidates = sorted(best_by_date.values(), key=lambda x: (x.score, x.dt), reverse=True)
+    return final_candidates, region_debug
 
 
 def annotate_page(
     page: fitz.Page,
     chosen: Optional[DateCandidate],
     candidates: List[DateCandidate],
-    original_text: str,
+    searchable_text: str,
     used_ocr: bool,
 ) -> None:
-    note_lines = []
+    lines = []
 
     if chosen:
-        note_lines.append(f"Chosen DOS: {chosen.normalized} ({chosen.raw_text})")
+        lines.append(
+            f"Chosen DOS: {chosen.normalized} ({chosen.raw_text}) | region={chosen.source_region} | score={chosen.score:.1f}"
+        )
     else:
-        note_lines.append("Chosen DOS: NONE")
+        lines.append("Chosen DOS: NONE")
 
     if candidates:
-        candidate_text = ", ".join(
-            [f"{c.normalized} [{c.raw_text}] score={c.score:.1f}" for c in candidates[:8]]
+        short = ", ".join(
+            [
+                f"{c.normalized} [{c.raw_text}] region={c.source_region} score={c.score:.1f}"
+                for c in candidates[:6]
+            ]
         )
-        note_lines.append(f"Candidates: {candidate_text}")
+        lines.append(f"Candidates: {short}")
     else:
-        note_lines.append("Candidates: NONE")
+        lines.append("Candidates: NONE")
 
-    note_lines.append(f"Used OCR: {used_ocr}")
+    lines.append(f"Used OCR: {used_ocr}")
 
-    note = "\n".join(note_lines)
+    page.add_text_annot((36, 36), "\n".join(lines))
 
-    # Put a small note near top-left.
-    page.add_text_annot((36, 36), note)
-
-    if chosen and original_text:
-        # Highlight exact chosen raw text matches if searchable text exists.
+    if chosen and searchable_text:
         try:
             rects = page.search_for(chosen.raw_text, quads=False)
             for rect in rects[:10]:
@@ -289,10 +393,7 @@ def annotate_page(
             pass
 
 
-def build_sorted_pdf(
-    source_doc: fitz.Document,
-    sorted_indices: List[int],
-) -> bytes:
+def build_sorted_pdf(source_doc: fitz.Document, sorted_indices: List[int]) -> bytes:
     out_doc = fitz.open()
     for index in sorted_indices:
         out_doc.insert_pdf(source_doc, from_page=index, to_page=index)
@@ -301,10 +402,7 @@ def build_sorted_pdf(
     return data
 
 
-def build_review_pdf(
-    source_doc: fitz.Document,
-    audit_rows: List[dict],
-) -> bytes:
+def build_review_pdf(source_doc: fitz.Document, audit_rows: List[dict]) -> bytes:
     review_doc = fitz.open()
     review_doc.insert_pdf(source_doc)
 
@@ -315,7 +413,7 @@ def build_review_pdf(
         chosen = None
         if row["chosen_date"]:
             for c in row["candidates"]:
-                if c["normalized"] == row["chosen_date"]:
+                if c["normalized"] == row["chosen_date"] and c["raw_text"] == row["chosen_raw_text"]:
                     chosen = DateCandidate(
                         raw_text=c["raw_text"],
                         normalized=c["normalized"],
@@ -324,6 +422,7 @@ def build_review_pdf(
                         start=0,
                         end=0,
                         context=c["context"],
+                        source_region=c["source_region"],
                     )
                     break
 
@@ -336,6 +435,7 @@ def build_review_pdf(
                 start=0,
                 end=0,
                 context=c["context"],
+                source_region=c["source_region"],
             )
             for c in row["candidates"]
         ]
@@ -344,7 +444,7 @@ def build_review_pdf(
             page=page,
             chosen=chosen,
             candidates=candidates,
-            original_text=row["searchable_text"],
+            searchable_text=row["searchable_text"],
             used_ocr=row["used_ocr"],
         )
 
@@ -367,33 +467,37 @@ def process_pdf(
 
     for page_index in range(len(source_doc)):
         page = source_doc[page_index]
-        text = extract_page_text(page)
-        searchable_text = text
-        used_ocr = False
 
-        if use_ocr and needs_ocr(text):
-            ocr_text = ocr_page(page)
-            if ocr_text:
-                text = ocr_text
-                used_ocr = True
-                ocr_pages += 1
+        candidates, region_debug = gather_candidates_for_page(
+            page=page,
+            use_ocr=use_ocr,
+            strict_context=strict_context,
+        )
 
-        candidates = extract_date_candidates(text, strict_context=strict_context)
         chosen = choose_candidate(candidates, mode=selection_mode)
+
+        used_ocr = region_debug["used_ocr_top_left"] or region_debug["used_ocr_full_page"]
+        if used_ocr:
+            ocr_pages += 1
+
+        searchable_text = extract_page_text(page)
 
         audit_row = {
             "original_page": page_index + 1,
             "chosen_date": chosen.normalized if chosen else None,
+            "chosen_raw_text": chosen.raw_text if chosen else None,
+            "chosen_region": chosen.source_region if chosen else None,
             "sort_key": chosen.normalized if chosen else None,
             "used_ocr": used_ocr,
             "searchable_text": searchable_text,
-            "text_excerpt": collapse_whitespace(text[:250]),
+            "text_excerpt": collapse_whitespace((region_debug["top_left_text"] or region_debug["ocr_top_left_text"] or searchable_text)[:250]),
             "candidates": [
                 {
                     "raw_text": c.raw_text,
                     "normalized": c.normalized,
                     "score": round(c.score, 2),
                     "context": c.context,
+                    "source_region": c.source_region,
                 }
                 for c in candidates
             ],
